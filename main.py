@@ -11,10 +11,19 @@ POST /stamp  (multipart/form-data, cabecera X-Api-Key)
   role       N1 | N2 | N3
   signer     nombre a imprimir bajo la firma
 Devuelve el PDF estampado. Cabeceras: X-Sha256-Before, X-Sha256-After, X-Page.
+
+POST /inspect  (multipart/form-data, cabecera X-Api-Key)
+  pdf        archivo PDF a analizar
+Devuelve información solo informativa (nunca bloqueante por firma digital):
+sha256 del archivo completo, sha256 de la revisión original (sin el último
+incremento), firmas digitales detectadas con cobertura/validez y estado de las
+casillas Cobra N1/N2/N3.
 """
 import hashlib
 import io
+import logging
 import os
+import re
 import shutil
 import tempfile
 from datetime import datetime
@@ -36,6 +45,7 @@ BOX_X0, BOX_X1, BOX_H = 427.1, 544.1, 59.3
 PAD = 3.0
 
 app = FastAPI()
+logging.getLogger("pyhanko").setLevel(logging.CRITICAL)
 
 
 def sha256(b: bytes) -> str:
@@ -140,6 +150,118 @@ async def stamp(
             "X-Page": str(pno + 1),
         },
     )
+
+
+def original_revision(data: bytes) -> bytes:
+    """Bytes del PDF sin la última revisión (todo hasta el penúltimo %%EOF).
+
+    Consume un único salto de línea tras %%EOF: los bytes extra (separador de
+    revisión de la actualización incremental) pertenecen a la revisión nueva.
+    """
+    marks = []
+    for m in re.finditer(b"%%EOF", data):
+        end = m.end()
+        if data[end:end + 2] == b"\r\n":
+            end += 2
+        elif data[end:end + 1] in (b"\n", b"\r"):
+            end += 1
+        marks.append(end)
+    if len(marks) >= 2:
+        return data[:marks[-2]]
+    return data
+
+
+def inspect_boxes(doc):
+    """Estado de las casillas Cobra por ancla, informativo."""
+    result = {}
+    for role in ANCHORS:
+        try:
+            pno, box = find_box(doc, role)
+            result[role] = {
+                "page": pno + 1,
+                "occupied": not box_is_empty(doc[pno], box),
+            }
+        except HTTPException as e:
+            result[role] = {"page": None, "occupied": None, "error": e.detail}
+    return result
+
+
+def inspect_signatures_sync(data: bytes):
+    """Enumera firmas digitales detectadas, solo informativo."""
+    try:
+        from pyhanko.pdf_utils.reader import PdfFileReader
+
+        reader = PdfFileReader(io.BytesIO(data))
+        return list(reader.embedded_signatures)
+    except Exception as e:
+        return [{"error": f"{type(e).__name__}: {e}"}]
+
+
+async def inspect_signatures(data: bytes):
+    """Firmas digitales detectadas, solo informativo (sin cadenas de confianza)."""
+    entries = []
+    try:
+        from pyhanko.sign.validation import async_validate_pdf_signature
+
+        for emb in inspect_signatures_sync(data):
+            if isinstance(emb, dict):
+                entries.append(emb)
+                continue
+            entry = {"field": emb.fq_name or emb.field_name or ""}
+            try:
+                status = await async_validate_pdf_signature(emb)
+                signer = None
+                try:
+                    if emb.signer_cert is not None:
+                        signer = emb.signer_cert.subject.human_readable
+                except Exception:
+                    pass
+                entry.update({
+                    "present": True,
+                    "valid": bool(status.valid),
+                    "intact": bool(status.intact),
+                    "docmdp_ok": bool(status.docmdp_ok) or None,
+                    "trusted": bool(status.trusted) or None,
+                    "signer": signer,
+                    "summary": status.summary(),
+                })
+            except Exception as e:
+                entry["error"] = f"{type(e).__name__}: {e}"
+            entries.append(entry)
+    except Exception as e:
+        entries.append({"error": f"{type(e).__name__}: {e}"})
+    return entries
+
+
+@app.post("/inspect")
+async def inspect(pdf: UploadFile = File(...), x_api_key: str = Header(default="")):
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(401, "API key no válida")
+    data = await pdf.read()
+    if not data.startswith(b"%PDF") or len(data) > MAX_BYTES:
+        raise HTTPException(400, "PDF no válido o mayor de 20 MB")
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+        if doc.needs_pass:
+            raise HTTPException(400, "PDF protegido con contraseña")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"PDF no válido: {e}")
+
+    try:
+        boxes = inspect_boxes(doc)
+        sigs = await inspect_signatures(data)
+        return {
+            "sha256": sha256(data),
+            "sha256_original_revision": sha256(original_revision(data)),
+            "revisions": max(len(list(re.finditer(b"startxref", data))), 1),
+            "page_count": doc.page_count,
+            "boxes": boxes,
+            "digital_signatures": sigs,
+        }
+    finally:
+        doc.close()
 
 
 @app.get("/health")
